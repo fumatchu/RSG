@@ -124,7 +124,7 @@ fi
 
 case "$INSTALL_CHOICE" in
   1)
-    bash "${INSTALL_DIR}/installer/RSG-Web-Install.sh"
+    bash "${INSTALL_DIR}/RSG-Web-Install.sh"
     ;;
   *)
     echo -e "  [${YELLOW}→${TEXTRESET}] Installation cancelled."
