@@ -1,1 +1,1 @@
-EZ install file 
+curl -fsSL https://raw.githubusercontent.com/fumatchu/RSG/main/RSG-Web-Installer.sh | bash
