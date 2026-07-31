@@ -26,6 +26,12 @@ step_info() { echo -e "  [${YELLOW}→${TEXTRESET}] $*"; }
 section()   { echo ""; echo -e "${CYAN}── $* ──${TEXTRESET}"; }
 
 # =============================================================
+# VALIDATION HELPERS
+# =============================================================
+validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; }
+validate_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+# =============================================================
 # STEP 1 -- ROOT + OS CHECK
 # =============================================================
 check_root_and_os() {
@@ -73,6 +79,39 @@ check_and_enable_selinux() {
 }
 
 # =============================================================
+# STEP 2b -- SYSTEM UPGRADE (dnf, ported from RADS-web)
+# =============================================================
+run_system_upgrade() {
+  section "System Upgrade"
+  local log="$LOGDIR/system-upgrade.log"; : > "$log"
+  step_info "Checking for available updates..."
+  local PIPE; PIPE=$(mktemp -u); mkfifo "$PIPE"
+  mapfile -t PACKAGE_LIST < <(dnf -q repoquery --upgrades --qf '%{name}' 2>/dev/null | sort -u)
+  local TOTAL=${#PACKAGE_LIST[@]}
+  if [[ $TOTAL -eq 0 ]]; then
+    step_ok "System already up to date"
+    rm -f "$PIPE"; sleep 1; return
+  fi
+  clear
+  dialog --backtitle "RSG-WEB Installer" --title "System Upgrade" \
+    --gauge "Starting system upgrade..." 10 70 0 < "$PIPE" &
+  local COUNT=0
+  {
+    for PKG in "${PACKAGE_LIST[@]}"; do
+      ((COUNT++))
+      local PCT=$(( COUNT * 100 / TOTAL ))
+      echo "$PCT"; echo "XXX"; echo "Upgrading: $PKG (${COUNT}/${TOTAL})"; echo "XXX"
+      dnf -y -q upgrade --color=never --best --allowerasing "$PKG" >>"$log" 2>&1
+    done
+    echo "100"; echo "XXX"; echo "Upgrade complete."; echo "XXX"
+  } > "$PIPE"
+  wait; rm -f "$PIPE"
+  clear; section "System Upgrade"
+  step_ok "System packages upgraded (${TOTAL} packages) -- see ${log}"
+  sleep 1
+}
+
+# =============================================================
 # STEP 3 -- BASE PACKAGES
 #
 # nftables is installed explicitly and BEFORE anything under
@@ -92,23 +131,34 @@ install_base_packages() {
   dnf -y install dnf-plugins-core --setopt=install_weak_deps=False --color=never >>"$log" 2>&1 || true
   step_ok "EPEL + dnf-plugins-core installed"
 
-  step_info "httpd + reverse proxy + TLS..."
-  dnf -y install httpd mod_ssl mod_proxy_html --color=never >>"$log" 2>&1
-  step_ok "httpd, mod_ssl, mod_proxy_html installed"
-
-  step_info "Python + FastAPI runtime deps..."
-  dnf -y install python3 python3-pip python3-devel python3-psutil \
-    policycoreutils-python-utils openssl --color=never >>"$log" 2>&1
-  step_ok "Python runtime deps installed"
-
-  step_info "nftables (before any custom config is written -- see comment above)..."
-  dnf -y install nftables --color=never >>"$log" 2>&1
-  step_ok "nftables installed"
-
-  step_info "Supporting utilities..."
-  dnf -y install fail2ban chrony bind-utils net-tools wget curl rsync \
-    nano htop at tuned --color=never >>"$log" 2>&1
-  step_ok "Supporting utilities installed"
+  # nftables is listed first in this list deliberately -- it must land
+  # before /etc/nftables/ or /etc/sysconfig/nftables.conf exist (see
+  # comment above), and the gauge loop below installs strictly in order.
+  local PKGS=(
+    nftables
+    httpd mod_ssl mod_proxy_html
+    python3 python3-pip python3-devel python3-psutil
+    policycoreutils-python-utils openssl
+    fail2ban chrony bind-utils net-tools wget curl rsync
+    nano htop at tuned
+  )
+  local TOTAL=${#PKGS[@]} COUNT=0
+  local PIPE; PIPE=$(mktemp -u); mkfifo "$PIPE"
+  clear
+  dialog --backtitle "RSG-WEB Installer" --title "Installing Base Packages" \
+    --gauge "Preparing..." 10 70 0 < "$PIPE" &
+  {
+    for PKG in "${PKGS[@]}"; do
+      ((COUNT++))
+      local PCT=$(( COUNT * 100 / TOTAL ))
+      echo "$PCT"; echo "XXX"; echo "Installing: $PKG (${COUNT}/${TOTAL})"; echo "XXX"
+      dnf -y -q install --color=never --setopt=tsflags=nodocs --setopt=install_weak_deps=False "$PKG" >>"$log" 2>&1
+    done
+    echo "100"; echo "XXX"; echo "Base packages installed."; echo "XXX"
+  } > "$PIPE"
+  wait; rm -f "$PIPE"
+  clear; section "Base Packages"
+  step_ok "Base packages installed (${TOTAL} packages) -- see ${log}"
   sleep 1
 }
 
@@ -155,16 +205,36 @@ deploy_rsg_web() {
   wget -q -O "$TARBALL" "$TARBALL_URL" 2>>"$log"
   if [[ $? -ne 0 || ! -s "$TARBALL" ]]; then
     step_info "Release tarball not found -- installing from cloned source..."
-    if [[ -d "$SRC_BASE" ]]; then
+    # SRC_BASE existing isn't enough -- a `git clone` of an empty/missing
+    # repo, or a partial manual copy, still leaves the directory itself
+    # in place with nothing useful inside it. Check for the actual
+    # source subdirectories the cp commands below depend on *before*
+    # running them, so a bad source is caught here with one clear
+    # message instead of three silent `cp: cannot stat` lines in this
+    # log and a cascade of confusing ModuleNotFoundError/restorecon
+    # failures in every step downstream.
+    if [[ -d "${SRC_BASE}/api" && -d "${SRC_BASE}/ui" ]]; then
       mkdir -p "$INSTALL_BASE"
       cp -r "${SRC_BASE}/api"       "$INSTALL_BASE/" >>"$log" 2>&1
       cp -r "${SRC_BASE}/ui"        "$INSTALL_BASE/" >>"$log" 2>&1
-      cp -r "${SRC_BASE}/installer" "$INSTALL_BASE/" >>"$log" 2>&1
-      [[ -d "${SRC_BASE}/upgrade" ]] && cp -r "${SRC_BASE}/upgrade" "$INSTALL_BASE/" >>"$log" 2>&1
-      [[ -f "${SRC_BASE}/VERSION" ]] && cp "${SRC_BASE}/VERSION" "$INSTALL_BASE/" >>"$log" 2>&1
-      step_ok "Installed from source: ${SRC_BASE}"
+      [[ -d "${SRC_BASE}/installer" ]] && cp -r "${SRC_BASE}/installer" "$INSTALL_BASE/" >>"$log" 2>&1
+      [[ -d "${SRC_BASE}/upgrade" ]]   && cp -r "${SRC_BASE}/upgrade"   "$INSTALL_BASE/" >>"$log" 2>&1
+      [[ -f "${SRC_BASE}/VERSION" ]]   && cp "${SRC_BASE}/VERSION"      "$INSTALL_BASE/" >>"$log" 2>&1
+      # Verify the copy actually landed something usable -- cp itself can
+      # still fail mid-copy (permissions, disk space) without this
+      # function noticing, and everything after this step assumes
+      # main.py/index.html are really there.
+      if [[ -f "${INSTALL_BASE}/api/main.py" && -f "${INSTALL_BASE}/ui/index.html" ]]; then
+        step_ok "Installed from source: ${SRC_BASE}"
+      else
+        step_fail "Copy from ${SRC_BASE} did not produce a usable install -- see ${log}"
+        step_info "Expected ${INSTALL_BASE}/api/main.py and ${INSTALL_BASE}/ui/index.html to exist after copying"
+        return 1
+      fi
     else
-      step_fail "No source or release package available"
+      step_fail "No release tarball and no usable source at ${SRC_BASE} (missing api/ and/or ui/)"
+      step_info "If you're testing from a partial checkout, make sure ${SRC_BASE}/api and ${SRC_BASE}/ui are populated"
+      step_info "Otherwise: build rsg-web.tar.gz (api/, ui/, installer/, upgrade/, VERSION at its root) and upload it to the GitHub Release fetched from ${TARBALL_URL}"
       return 1
     fi
   else
@@ -257,10 +327,37 @@ remove_firewalld() {
     systemctl disable --now firewalld >>"$log" 2>&1
     systemctl mask firewalld >>"$log" 2>&1
     step_info "Removing firewalld package..."
-    dnf remove -y firewalld --color=never >>"$log" 2>&1
+    # firewalld's own backend depends on nftables, and fail2ban pulls in
+    # fail2ban-firewalld as a weak dep -- dnf's default "clean up unused
+    # dependencies" behavior on a plain `dnf remove firewalld` has been
+    # observed taking BOTH nftables and fail2ban down with it (confirmed
+    # from a live install log: "Removing dependent packages: fail2ban"
+    # and "Removing unused dependencies: nftables..." in the same
+    # transaction), which then breaks every later step that assumes
+    # either one is still installed. clean_requirements_on_remove=false
+    # scopes this removal to firewalld itself, nothing else.
+    dnf remove -y firewalld --color=never --setopt=clean_requirements_on_remove=false >>"$log" 2>&1
     step_ok "firewalld disabled, masked, and removed"
   else
     step_ok "firewalld not present -- nothing to remove"
+  fi
+
+  # Belt-and-suspenders: reinstall either package if it's somehow still
+  # missing after the above (an older dnf, a different removal path,
+  # whatever) -- cheap no-op if they're already present.
+  if ! command -v nft >/dev/null 2>&1; then
+    step_info "nftables missing after firewalld removal -- reinstalling..."
+    dnf -y install nftables --color=never >>"$log" 2>&1
+    command -v nft >/dev/null 2>&1 \
+      && step_ok "nftables reinstalled" \
+      || step_fail "nftables reinstall failed -- see ${log}"
+  fi
+  if ! rpm -q fail2ban >/dev/null 2>&1; then
+    step_info "fail2ban missing after firewalld removal -- reinstalling..."
+    dnf -y install fail2ban --color=never >>"$log" 2>&1
+    rpm -q fail2ban >/dev/null 2>&1 \
+      && step_ok "fail2ban reinstalled" \
+      || step_fail "fail2ban reinstall failed -- see ${log}"
   fi
   sleep 1
 }
@@ -355,6 +452,16 @@ include "/etc/nftables/main.nft"
 # start by calling: 'nft list ruleset >/etc/sysconfig/nftables.conf'.
 EOF
   step_ok "/etc/sysconfig/nftables.conf written"
+
+  # Defense-in-depth: remove_firewalld() already guards against dnf
+  # sweeping nftables away as an "unused dependency" of firewalld, but
+  # guard here too in case this function is ever called on its own or
+  # the package was removed by some other path.
+  if ! command -v nft >/dev/null 2>&1; then
+    step_info "nft binary not found -- installing nftables..."
+    dnf -y install nftables --color=never >>"$log" 2>&1
+    command -v nft >/dev/null 2>&1 || { step_fail "nftables install failed -- see ${log}"; return 1; }
+  fi
 
   nft -c -f /etc/nftables/main.nft >>"$log" 2>&1
   if [[ $? -ne 0 ]]; then
@@ -531,6 +638,18 @@ EOF
 configure_fail2ban() {
   section "Fail2ban"
   local log="$LOGDIR/fail2ban.log"; : > "$log"
+
+  # Defense-in-depth: remove_firewalld() already guards against dnf
+  # sweeping fail2ban away as an "unused dependency" of firewalld, but
+  # guard here too in case this function is ever called on its own or
+  # the package was removed by some other path.
+  if ! rpm -q fail2ban >/dev/null 2>&1; then
+    step_info "fail2ban not installed -- installing..."
+    dnf -y install fail2ban --color=never >>"$log" 2>&1
+    rpm -q fail2ban >/dev/null 2>&1 || { step_fail "fail2ban install failed -- see ${log}"; return 1; }
+  fi
+  mkdir -p /etc/fail2ban/jail.d
+
   [[ -f /etc/fail2ban/jail.conf ]] && cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local >>"$log" 2>&1 || true
   cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
@@ -622,15 +741,120 @@ EOF
 }
 
 # =============================================================
+# INTERFACE ADDRESSING (static IP / DHCP + NTP), ported from
+# RADS-web's prompt_static_ip_if_dhcp() / configure_ntp(), adapted
+# for RSG's per-role (Inside/Outside) dual-interface topology instead
+# of a single AD-DC uplink. Called by configure_interface_topology()
+# below, once per assigned interface.
+# =============================================================
+get_connection_for_iface() {
+  local iface="$1"
+  nmcli -t -f NAME,DEVICE connection show 2>/dev/null | awk -F: -v d="$iface" '$2==d{print $1; exit}'
+}
+
+apply_ntp_server() {
+  local ntp="$1"
+  local log="$LOGDIR/chrony.log"; : > "$log"
+  [[ -z "$ntp" ]] && return 0
+  cp /etc/chrony.conf /etc/chrony.conf.bak 2>/dev/null || true
+  sed -i '/^\(server\|pool\)[[:space:]]/d' /etc/chrony.conf
+  echo "server ${ntp} iburst" >> /etc/chrony.conf
+  systemctl enable --now chronyd >>"$log" 2>&1
+  systemctl restart chronyd >>"$log" 2>&1
+  step_ok "NTP server set to ${ntp}"
+}
+
+prompt_iface_addressing() {
+  local iface="$1" role="$2" ask_ntp="${3:-0}"
+  local log="$LOGDIR/topology.log"
+  local conn; conn=$(get_connection_for_iface "$iface")
+  if [[ -z "$conn" ]]; then
+    step_fail "No NetworkManager connection found for ${iface} -- skipping addressing prompt (configure manually later)"
+    return 1
+  fi
+
+  local METHOD
+  METHOD=$(dialog --backtitle "RSG-WEB Installer" --title "${role} Interface -- ${iface}" \
+    --menu "How should ${iface} (${role}) get its IP address?" \
+    12 70 2 \
+    "static" "Static IP (recommended for ${role})" \
+    "dhcp"   "DHCP (automatic)" \
+    3>&1 1>&2 2>&3)
+  clear
+  if [[ -z "$METHOD" ]]; then
+    step_info "${role} (${iface}): no choice made -- leaving current addressing as-is"
+  elif [[ "$METHOD" == "dhcp" ]]; then
+    nmcli con mod "$conn" ipv4.method auto ipv4.addresses "" ipv4.gateway "" >>"$log" 2>&1
+    nmcli con up "$conn" >>"$log" 2>&1 || true
+    step_ok "${role} (${iface}): set to DHCP"
+  else
+    local IPADDR GW DNSSERVER
+    while true; do
+      IPADDR=$(dialog --backtitle "RSG-WEB Installer" --title "${role} -- Static IP" \
+        --inputbox "Enter static IP in CIDR format for ${iface} (e.g., 192.168.1.1/24):" \
+        9 72 3>&1 1>&2 2>&3)
+      clear
+      validate_cidr "$IPADDR" && break || dialog --msgbox "Invalid CIDR format. Try again." 6 40
+    done
+    while true; do
+      GW=$(dialog --backtitle "RSG-WEB Installer" --title "${role} -- Gateway" \
+        --inputbox "Enter default gateway for ${iface} (leave blank if none, e.g. Outside handed off by an upstream router):" 8 70 3>&1 1>&2 2>&3)
+      clear
+      { [[ -z "$GW" ]] || validate_ip "$GW"; } && break || dialog --msgbox "Invalid IP. Try again." 6 40
+    done
+    while true; do
+      DNSSERVER=$(dialog --backtitle "RSG-WEB Installer" --title "${role} -- DNS Server" \
+        --inputbox "Enter DNS server IP(s) for ${iface}, comma-separated (leave blank to skip):" 9 72 3>&1 1>&2 2>&3)
+      clear
+      if [[ -z "$DNSSERVER" ]]; then break; fi
+      local bad=0 d
+      IFS=',' read -ra _dns <<< "$DNSSERVER"
+      for d in "${_dns[@]}"; do validate_ip "$(echo "$d" | xargs)" || bad=1; done
+      [[ $bad -eq 0 ]] && break || dialog --msgbox "Invalid DNS IP in list. Try again." 6 40
+    done
+
+    dialog --backtitle "RSG-WEB Installer" --title "Confirm ${role} Settings" \
+      --yesno "Apply these settings to ${iface} (${role})?\n\nIP: ${IPADDR}\nGateway: ${GW:-none}\nDNS: ${DNSSERVER:-none}" \
+      12 65
+    local confirm=$?
+    clear
+    if [[ $confirm -ne 0 ]]; then
+      step_info "${role} (${iface}): settings not applied (cancelled)"
+    else
+      local NMARGS=(ipv4.addresses "$IPADDR" ipv4.method manual)
+      [[ -n "$GW" ]] && NMARGS+=(ipv4.gateway "$GW")
+      [[ -n "$DNSSERVER" ]] && NMARGS+=(ipv4.dns "$DNSSERVER")
+      nmcli con mod "$conn" "${NMARGS[@]}" >>"$log" 2>&1
+      nmcli con up "$conn" >>"$log" 2>&1 || true
+      step_ok "${role} (${iface}): static ${IPADDR}${GW:+, gw ${GW}}${DNSSERVER:+, dns ${DNSSERVER}}"
+    fi
+  fi
+
+  if [[ "$ask_ntp" -eq 1 ]]; then
+    local NTPSRV
+    NTPSRV=$(dialog --backtitle "RSG-WEB Installer" --title "NTP Server" \
+      --inputbox "Enter an NTP server IP or FQDN for this appliance (or press Enter for pool.ntp.org):" \
+      8 70 "pool.ntp.org" 3>&1 1>&2 2>&3)
+    clear
+    [[ -z "$NTPSRV" ]] && NTPSRV="pool.ntp.org"
+    apply_ntp_server "$NTPSRV"
+  fi
+  sleep 1
+}
+
+# =============================================================
 # STEP 16 -- DAY-ONE INTERFACE TOPOLOGY
 #
 # Calls zones_apply.describe_topology() (api/zones_apply.py) to decide
 # which of three paths applies, based purely on how many physical
 # interfaces nmcli sees:
-#   1 interface  -> auto-assigned to Inside, no prompt
+#   1 interface  -> auto-assigned to Inside, no prompt, then
+#                   prompted for static/DHCP + NTP + DNS
 #   2 interfaces -> dialog asks which is Inside; the other becomes
 #                   Outside (zero ports open) with NAT/forwarding
-#                   wired up automatically
+#                   wired up automatically. Inside is then prompted
+#                   for static/DHCP + NTP + DNS; Outside is prompted
+#                   for static/DHCP only.
 #   3+ interfaces (or 0) -> nothing auto-assigned; operator is told
 #                   what was detected and points to the Zones/
 #                   Interfaces pages to finish setup after first boot
@@ -668,8 +892,12 @@ ok, msg = za.apply_single_interface_topology('${IFACE}')
 print(msg)
 sys.exit(0 if ok else 1)
 " >>"$log" 2>&1
-      [[ $? -eq 0 ]] && step_ok "${IFACE} assigned to Inside (level 100)" \
-        || step_fail "Failed to assign ${IFACE} -- see ${log}"
+      if [[ $? -eq 0 ]]; then
+        step_ok "${IFACE} assigned to Inside (level 100)"
+        prompt_iface_addressing "$IFACE" "Inside" 1
+      else
+        step_fail "Failed to assign ${IFACE} -- see ${log}"
+      fi
       ;;
 
     dual)
@@ -698,8 +926,13 @@ ok, msg = za.apply_dual_interface_topology('${INSIDE}', '${OUTSIDE}', nat=True)
 print(msg)
 sys.exit(0 if ok else 1)
 " >>"$log" 2>&1
-        [[ $? -eq 0 ]] && step_ok "Inside=${INSIDE} / Outside=${OUTSIDE} applied, NAT enabled" \
-          || step_fail "Failed to apply topology -- see ${log}"
+        if [[ $? -eq 0 ]]; then
+          step_ok "Inside=${INSIDE} / Outside=${OUTSIDE} applied, NAT enabled"
+          prompt_iface_addressing "$INSIDE" "Inside" 1
+          prompt_iface_addressing "$OUTSIDE" "Outside" 0
+        else
+          step_fail "Failed to apply topology -- see ${log}"
+        fi
       fi
       ;;
 
@@ -731,9 +964,13 @@ sleep 1
 
 check_root_and_os
 check_and_enable_selinux
+run_system_upgrade
 install_base_packages
 install_python_packages
-deploy_rsg_web
+deploy_rsg_web || {
+  step_fail "Deployment failed -- nothing past this point can work without ${INSTALL_BASE}/api and ${INSTALL_BASE}/ui. Aborting."
+  exit 1
+}
 scrape_known_services
 remove_firewalld
 configure_nftables
