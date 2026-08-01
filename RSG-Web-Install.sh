@@ -41,6 +41,21 @@ TOPOLOGY_APPLY_MARKER="/etc/rsg-web-installer/.topology-applied"
 # to a static IP -- signals configure_interface_topology_prompt() to
 # reboot once all topology questions have been answered.
 STATIC_IP_CONFIGURED=0
+# Set to 1 by prompt_iface_addressing() below if ANY interface's
+# addressing was changed at all (static or DHCP) -- staged via `nmcli
+# con mod` only, never applied live with `nmcli con up`, so a reboot is
+# what actually brings up the new addressing. This is also what
+# triggers the reboot (broader than STATIC_IP_CONFIGURED, which only
+# covers the static case) -- see the RADS-web precedent this is ported
+# from, which never brings a changed connection up live either, only
+# via reboot, specifically so a change to the interface carrying the
+# operator's own SSH/console session doesn't disconnect them mid-prompt
+# with no warning.
+NETWORK_CHANGED=0
+# Human-readable lines (dialog "\n"-joined) describing what changed on
+# each interface, built up by prompt_iface_addressing() below, so the
+# pre-reboot dialog can tell the operator exactly where to reconnect.
+RECONNECT_INFO=""
 
 # =============================================================
 # OUTPUT HELPERS
@@ -55,6 +70,10 @@ section()   { echo ""; echo -e "${CYAN}── $* ──${TEXTRESET}"; }
 # =============================================================
 validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; }
 validate_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+# Plain hostname or FQDN -- RSG isn't AD-domain-joined like RADS-web, so
+# this is deliberately looser than RADS's validate_fqdn() (no forced
+# multi-label host.domain.tld requirement, no domain-membership check).
+validate_hostname_format() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }
 
 # =============================================================
 # STEP 1 -- ROOT + OS CHECK
@@ -99,6 +118,39 @@ check_and_enable_selinux() {
     setenforce 1 2>/dev/null || true
     [[ "$(getenforce)" == "Enforcing" ]] && step_ok "SELinux enabled (Enforcing)" \
       || step_fail "SELinux could not be set to Enforcing -- check config manually"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP -- HOSTNAME, ported from RADS-web's validate_and_set_hostname().
+# Only prompts if the hostname is still Rocky's default unconfigured
+# value -- once set, this check is naturally false on any later
+# re-invocation (e.g. after the interface-topology reboot/resume above),
+# so no separate marker/skip-state is needed the way the topology step
+# needs one.
+# =============================================================
+validate_and_set_hostname() {
+  section "Hostname"
+  local current; current=$(hostname)
+  if [[ "$current" == "localhost.localdomain" || "$current" == "localhost" ]]; then
+    local NEW_HOSTNAME
+    while true; do
+      NEW_HOSTNAME=$(dialog --backtitle "RSG-WEB Installer" --title "Set Hostname" \
+        --inputbox "Current hostname is '${current}'.\nEnter a hostname for this appliance (e.g., rsg-gw or gw1.example.com):" \
+        9 70 3>&1 1>&2 2>&3)
+      clear
+      if validate_hostname_format "$NEW_HOSTNAME"; then
+        hostnamectl set-hostname "$NEW_HOSTNAME"
+        step_ok "Hostname set to: ${NEW_HOSTNAME}"
+        break
+      else
+        dialog --msgbox "Invalid hostname. Use letters, digits, hyphens, and dots only." 6 60
+        clear
+      fi
+    done
+  else
+    step_ok "Hostname: ${current}"
   fi
   sleep 1
 }
@@ -821,9 +873,17 @@ prompt_iface_addressing() {
   if [[ -z "$METHOD" ]]; then
     step_info "${role} (${iface}): no choice made -- leaving current addressing as-is"
   elif [[ "$METHOD" == "dhcp" ]]; then
+    # Staged with `nmcli con mod` only -- deliberately NOT brought up live
+    # with `nmcli con up` here. If this is the interface carrying the
+    # operator's own SSH/console session, bringing it up immediately would
+    # disconnect them with zero warning, mid-prompt, before they've even
+    # finished answering the rest of the topology questions. The change
+    # takes effect on the reboot at the end of
+    # configure_interface_topology_prompt(), which warns first.
     nmcli con mod "$conn" ipv4.method auto ipv4.addresses "" ipv4.gateway "" >>"$log" 2>&1
-    nmcli con up "$conn" >>"$log" 2>&1 || true
-    step_ok "${role} (${iface}): set to DHCP"
+    step_ok "${role} (${iface}): set to DHCP (takes effect after reboot)"
+    NETWORK_CHANGED=1
+    RECONNECT_INFO="${RECONNECT_INFO}\n${role} (${iface}): DHCP -- check your router/DHCP server for the assigned address"
   else
     local IPADDR GW DNSSERVER
     while true; do
@@ -861,10 +921,17 @@ prompt_iface_addressing() {
       local NMARGS=(ipv4.addresses "$IPADDR" ipv4.method manual)
       [[ -n "$GW" ]] && NMARGS+=(ipv4.gateway "$GW")
       [[ -n "$DNSSERVER" ]] && NMARGS+=(ipv4.dns "$DNSSERVER")
+      # Staged only, same reasoning as the DHCP branch above -- no
+      # `nmcli con up` here. Applying a new static address live would
+      # disconnect an SSH/console session on this interface with no
+      # warning; the reboot at the end of
+      # configure_interface_topology_prompt() is what actually brings
+      # this up, after telling the operator exactly where to reconnect.
       nmcli con mod "$conn" "${NMARGS[@]}" >>"$log" 2>&1
-      nmcli con up "$conn" >>"$log" 2>&1 || true
-      step_ok "${role} (${iface}): static ${IPADDR}${GW:+, gw ${GW}}${DNSSERVER:+, dns ${DNSSERVER}}"
+      step_ok "${role} (${iface}): static ${IPADDR}${GW:+, gw ${GW}}${DNSSERVER:+, dns ${DNSSERVER}} (takes effect after reboot)"
       STATIC_IP_CONFIGURED=1
+      NETWORK_CHANGED=1
+      RECONNECT_INFO="${RECONNECT_INFO}\n${role} (${iface}): ${IPADDR%%/*}"
     fi
   fi
 
@@ -994,7 +1061,7 @@ configure_interface_topology_prompt() {
     [[ -n "$sel_outside" ]] && echo "TOPO_OUTSIDE=${sel_outside}"
   } > "$TOPOLOGY_STATE_FILE"
 
-  if [[ "$STATIC_IP_CONFIGURED" -eq 1 ]]; then
+  if [[ "$NETWORK_CHANGED" -eq 1 ]]; then
     local profile="/root/.bash_profile"
     if ! grep -q "RSG-WEB Installer -- auto-resume after reboot" "$profile" 2>/dev/null; then
       {
@@ -1004,9 +1071,14 @@ configure_interface_topology_prompt() {
         echo 'fi'
       } >> "$profile"
     fi
+    # Nothing above was applied live (see the "takes effect after
+    # reboot" notes in prompt_iface_addressing()) -- this reboot is what
+    # actually brings the new addressing up, and this is the one and
+    # only place the operator is told about it, with exactly where to
+    # reconnect, before it happens.
     dialog --backtitle "RSG-WEB Installer" --title "Reboot Required" \
-      --msgbox "Network settings applied.\n\nThe system will reboot now to bring up the new addressing. Just log back in as root afterward -- the installer resumes automatically and picks up right where it left off." \
-      10 70
+      --msgbox "Interface addressing changed. Nothing was applied live -- the system will reboot now to bring the new addressing up.\n\nReconnect at:${RECONNECT_INFO}\n\nJust log back in as root afterward -- the installer resumes automatically and picks up right where it left off." \
+      14 74
     clear
     step_info "Rebooting to apply new network settings -- installer resumes automatically after login..."
     reboot
@@ -1136,6 +1208,7 @@ check_and_enable_selinux
 # /root/.bash_profile hook that re-launches this script on next login)
 # and does not return from that call in that case.
 configure_interface_topology_prompt
+validate_and_set_hostname
 
 run_system_upgrade
 install_base_packages
