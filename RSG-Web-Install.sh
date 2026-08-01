@@ -25,14 +25,21 @@ mkdir -p "$LOGDIR"
 # already-extracted release tarball (/opt/rsg-web/installer/...).
 SCRIPT_PATH="$(readlink -f "$0")"
 
-# Marker that day-one interface topology/addressing/NTP questions have
-# already been asked -- set once configure_interface_topology() finishes,
-# so a reboot-and-resume (triggered by a static IP change) skips straight
-# past the questions instead of re-prompting.
-TOPOLOGY_MARKER="/etc/rsg-web-installer/.topology-complete"
+# Written by configure_interface_topology_prompt() once all day-one
+# interface/addressing/NTP questions have been asked -- both marks that
+# step done (so a reboot-and-resume triggered by a static IP change
+# skips straight past the questions instead of re-prompting) and records
+# which case/interfaces were chosen, as TOPO_CASE/TOPO_IFACE/TOPO_INSIDE/
+# TOPO_OUTSIDE shell variables, for configure_interface_topology_apply()
+# to `source` and act on later, once RSG-Web is actually deployed and
+# api/zones_apply.py exists to import.
+TOPOLOGY_STATE_FILE="/etc/rsg-web-installer/topology-state.env"
+# Marks configure_interface_topology_apply() as already run, so it isn't
+# re-applied if this script is somehow re-invoked after that point.
+TOPOLOGY_APPLY_MARKER="/etc/rsg-web-installer/.topology-applied"
 # Set to 1 by prompt_iface_addressing() below if any interface was moved
-# to a static IP -- signals configure_interface_topology() to reboot once
-# all topology questions have been answered.
+# to a static IP -- signals configure_interface_topology_prompt() to
+# reboot once all topology questions have been answered.
 STATIC_IP_CONFIGURED=0
 
 # =============================================================
@@ -157,7 +164,7 @@ install_base_packages() {
     httpd mod_ssl mod_proxy_html
     python3 python3-pip python3-devel python3-psutil
     policycoreutils-python-utils openssl
-    fail2ban chrony bind-utils net-tools wget curl rsync
+    fail2ban chrony bind-utils net-tools wget curl rsync tar gzip
     nano htop at tuned
   )
   local TOTAL=${#PKGS[@]} COUNT=0
@@ -212,34 +219,11 @@ install_python_packages() {
 }
 
 # =============================================================
-# STEP 3 -- ENSURE PYTHON3 (early, minimal)
-#
-# configure_interface_topology() below (moved up to run before the
-# rest of the package set is installed, so every operator question is
-# asked up front) needs python3 to import api/zones_apply.py for
-# topology detection/assignment. deploy_rsg_web() right after this
-# puts api/ on disk, but python3 itself normally only arrives later via
-# install_base_packages()'s full gauge run -- this is a fast,
-# standalone check/install so that dependency is satisfied without
-# pulling the whole base-packages list forward.
-# =============================================================
-ensure_python3_available() {
-  section "Python3 (early bootstrap)"
-  if command -v python3 >/dev/null 2>&1; then
-    step_ok "python3 already present"
-  else
-    step_info "python3 not found -- installing (needed for interface topology detection)..."
-    local log="$LOGDIR/python3-bootstrap.log"; : > "$log"
-    dnf -y -q install python3 --color=never --setopt=install_weak_deps=False >>"$log" 2>&1
-    command -v python3 >/dev/null 2>&1 \
-      && step_ok "python3 installed" \
-      || { step_fail "python3 install failed -- see ${log}"; exit 1; }
-  fi
-  sleep 1
-}
-
-# =============================================================
-# STEP 4 -- DEPLOY RSG-WEB APPLICATION
+# STEP -- DEPLOY RSG-WEB APPLICATION (runs late -- see MAIN below.
+# Everything that needs api/ or ui/ on disk -- this, the topology
+# *apply* step, the known-services scrape, and the SELinux restorecon
+# on ui/ -- is grouped together after configure_chrony, once RSG-Web is
+# actually deployed.)
 # =============================================================
 deploy_rsg_web() {
   section "Deploy RSG-Web Application"
@@ -797,7 +781,7 @@ EOF
 # INTERFACE ADDRESSING (static IP / DHCP + NTP), ported from
 # RADS-web's prompt_static_ip_if_dhcp() / configure_ntp(), adapted
 # for RSG's per-role (Inside/Outside) dual-interface topology instead
-# of a single AD-DC uplink. Called by configure_interface_topology()
+# of a single AD-DC uplink. Called by configure_interface_topology_prompt()
 # below, once per assigned interface.
 # =============================================================
 get_connection_for_iface() {
@@ -897,12 +881,14 @@ prompt_iface_addressing() {
 }
 
 # =============================================================
-# STEP 6 -- DAY-ONE INTERFACE TOPOLOGY (asked up front, before any
-# package installs -- see MAIN below)
+# STEP 6 -- DAY-ONE INTERFACE TOPOLOGY: PROMPT (asked up front, before
+# ANY package installs or deploy -- see MAIN below)
 #
-# Calls zones_apply.describe_topology() (api/zones_apply.py) to decide
-# which of three paths applies, based purely on how many physical
-# interfaces nmcli sees:
+# Detects topology directly via nmcli (no python/api dependency -- RSG-
+# Web isn't deployed yet at this point in the run) using the same
+# physical-ethernet-only filter api/zones_apply.py's
+# detect_physical_interfaces() uses, to decide which of three paths
+# applies:
 #   1 interface  -> auto-assigned to Inside, no prompt, then
 #                   prompted for static/DHCP + NTP + DNS
 #   2 interfaces -> dialog asks which is Inside; the other becomes
@@ -914,63 +900,59 @@ prompt_iface_addressing() {
 #                   what was detected and points to the Zones/
 #                   Interfaces pages to finish setup after first boot
 #
+# This function only asks questions and applies network-level changes
+# (nmcli addressing, chrony NTP) -- it does NOT touch nftables zone
+# assignment, since that requires api/zones_apply.py, which doesn't
+# exist on disk yet. Instead it records the case/interface choice to
+# TOPOLOGY_STATE_FILE for configure_interface_topology_apply() (below)
+# to actually apply later, once RSG-Web is deployed.
+#
 # If any interface is set to a static IP below, this function reboots
 # the box once all questions are answered (writing a resume hook to
 # /root/.bash_profile first so the installer picks back up automatically
-# on next login) -- see the end of this function. TOPOLOGY_MARKER makes
-# that resume skip straight past these questions instead of re-asking.
+# on next login) -- see the end of this function. TOPOLOGY_STATE_FILE
+# existing is what makes that resume skip straight past these questions
+# instead of re-asking.
 # =============================================================
-configure_interface_topology() {
+configure_interface_topology_prompt() {
   section "Interface Topology"
   local log="$LOGDIR/topology.log"; : > "$log"
 
-  if [[ -f "$TOPOLOGY_MARKER" ]]; then
+  if [[ -f "$TOPOLOGY_STATE_FILE" ]]; then
     step_ok "Interface topology already configured (resumed after reboot) -- skipping"
     sleep 1
     return 0
   fi
 
-  local TOPO
-  TOPO=$(python3 -c "
-import sys, json
-sys.path.insert(0, '${INSTALL_BASE}/api')
-import zones_apply as za
-print(json.dumps(za.describe_topology()))
-" 2>>"$log")
-
-  if [[ -z "$TOPO" ]]; then
-    step_fail "Could not detect interfaces -- see ${log}"
-    return 1
-  fi
+  # Physical ethernet devices only -- same filter as
+  # zones_apply.detect_physical_interfaces()/interfaces._list_devices()
+  # (type=="ethernet" excludes loopback, RSG's own ifb-* QoS devices,
+  # and anything else nmcli reports that isn't a real NIC).
+  local -a IFACES_ARR=()
+  local _line
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && IFACES_ARR+=("$_line")
+  done < <(nmcli -t -f DEVICE,TYPE device status 2>>"$log" | awk -F: '$2=="ethernet"{print $1}')
+  local n=${#IFACES_ARR[@]}
 
   local CASE
-  CASE=$(echo "$TOPO" | python3 -c "import sys, json; print(json.load(sys.stdin)['case'])")
+  if   [[ $n -eq 0 ]]; then CASE="none"
+  elif [[ $n -eq 1 ]]; then CASE="single"
+  elif [[ $n -eq 2 ]]; then CASE="dual"
+  else CASE="multi"
+  fi
+
+  local sel_iface="" sel_inside="" sel_outside=""
 
   case "$CASE" in
     single)
-      local IFACE
-      IFACE=$(echo "$TOPO" | python3 -c "import sys, json; print(json.load(sys.stdin)['interfaces'][0])")
-      step_info "One interface detected (${IFACE}) -- assigning it to Inside automatically"
-      python3 -c "
-import sys
-sys.path.insert(0, '${INSTALL_BASE}/api')
-import zones_apply as za
-ok, msg = za.apply_single_interface_topology('${IFACE}')
-print(msg)
-sys.exit(0 if ok else 1)
-" >>"$log" 2>&1
-      if [[ $? -eq 0 ]]; then
-        step_ok "${IFACE} assigned to Inside (level 100)"
-        prompt_iface_addressing "$IFACE" "Inside" 1
-      else
-        step_fail "Failed to assign ${IFACE} -- see ${log}"
-      fi
+      sel_iface="${IFACES_ARR[0]}"
+      step_info "One interface detected (${sel_iface}) -- will be assigned to Inside once RSG-Web is deployed"
+      prompt_iface_addressing "$sel_iface" "Inside" 1
       ;;
 
     dual)
-      local IFACES IF_A IF_B
-      IFACES=$(echo "$TOPO" | python3 -c "import sys, json; print(' '.join(json.load(sys.stdin)['interfaces']))")
-      read -r IF_A IF_B <<< "$IFACES"
+      local IF_A="${IFACES_ARR[0]}" IF_B="${IFACES_ARR[1]}"
       local INSIDE
       INSIDE=$(dialog --backtitle "RSG-WEB Installer" --title "Choose Inside Interface" \
         --menu "Two interfaces detected. Which one is Inside (trusted, level 100)?\nThe other becomes Outside (untrusted, level 0, no ports open) and gets NATted through automatically." \
@@ -982,35 +964,21 @@ sys.exit(0 if ok else 1)
       if [[ -z "$INSIDE" ]]; then
         step_info "No interface chosen -- skipping topology assignment (configure manually later)"
       else
-        local OUTSIDE
-        [[ "$INSIDE" == "$IF_A" ]] && OUTSIDE="$IF_B" || OUTSIDE="$IF_A"
-        step_info "Inside=${INSIDE}, Outside=${OUTSIDE} -- applying..."
-        python3 -c "
-import sys
-sys.path.insert(0, '${INSTALL_BASE}/api')
-import zones_apply as za
-ok, msg = za.apply_dual_interface_topology('${INSIDE}', '${OUTSIDE}', nat=True)
-print(msg)
-sys.exit(0 if ok else 1)
-" >>"$log" 2>&1
-        if [[ $? -eq 0 ]]; then
-          step_ok "Inside=${INSIDE} / Outside=${OUTSIDE} applied, NAT enabled"
-          prompt_iface_addressing "$INSIDE" "Inside" 1
-          prompt_iface_addressing "$OUTSIDE" "Outside" 0
-        else
-          step_fail "Failed to apply topology -- see ${log}"
-        fi
+        [[ "$INSIDE" == "$IF_A" ]] && sel_outside="$IF_B" || sel_outside="$IF_A"
+        sel_inside="$INSIDE"
+        step_ok "Inside=${sel_inside}, Outside=${sel_outside} selected -- will be applied once RSG-Web is deployed"
+        prompt_iface_addressing "$sel_inside" "Inside" 1
+        prompt_iface_addressing "$sel_outside" "Outside" 0
       fi
       ;;
 
     multi)
-      local IFACES
-      IFACES=$(echo "$TOPO" | python3 -c "import sys, json; print(', '.join(json.load(sys.stdin)['interfaces']))")
+      local IFACE_LIST; IFACE_LIST=$(IFS=', '; echo "${IFACES_ARR[*]}")
       dialog --backtitle "RSG-WEB Installer" --title "Multiple Interfaces Detected" \
-        --msgbox "Detected: ${IFACES}\n\nWith 3+ interfaces, zone assignment isn't automatic -- deciding what a 3rd/4th NIC is for (DMZ, guest, second WAN...) is a deployment-specific call.\n\nConfigure each one from the Zones and Interfaces pages once RSG-Web is up." \
+        --msgbox "Detected: ${IFACE_LIST}\n\nWith 3+ interfaces, zone assignment isn't automatic -- deciding what a 3rd/4th NIC is for (DMZ, guest, second WAN...) is a deployment-specific call.\n\nConfigure each one from the Zones and Interfaces pages once RSG-Web is up." \
         14 76
       clear
-      step_info "Detected: ${IFACES} -- none auto-assigned, configure via the web UI"
+      step_info "Detected: ${IFACE_LIST} -- none auto-assigned, configure via the web UI"
       ;;
 
     none)
@@ -1018,8 +986,13 @@ sys.exit(0 if ok else 1)
       ;;
   esac
 
-  mkdir -p "$(dirname "$TOPOLOGY_MARKER")"
-  touch "$TOPOLOGY_MARKER"
+  mkdir -p "$(dirname "$TOPOLOGY_STATE_FILE")"
+  {
+    echo "TOPO_CASE=${CASE}"
+    [[ -n "$sel_iface" ]]   && echo "TOPO_IFACE=${sel_iface}"
+    [[ -n "$sel_inside" ]]  && echo "TOPO_INSIDE=${sel_inside}"
+    [[ -n "$sel_outside" ]] && echo "TOPO_OUTSIDE=${sel_outside}"
+  } > "$TOPOLOGY_STATE_FILE"
 
   if [[ "$STATIC_IP_CONFIGURED" -eq 1 ]]; then
     local profile="/root/.bash_profile"
@@ -1040,6 +1013,84 @@ sys.exit(0 if ok else 1)
     exit 0
   fi
 
+  sleep 1
+}
+
+# =============================================================
+# STEP -- DAY-ONE INTERFACE TOPOLOGY: APPLY (runs late, right after
+# deploy_rsg_web() -- see MAIN below)
+#
+# Reads the case/interface choice configure_interface_topology_prompt()
+# recorded in TOPOLOGY_STATE_FILE and actually applies it via
+# api/zones_apply.py -- split out from the prompt step because this
+# needs RSG-Web already deployed (api/zones_apply.py has to exist on
+# disk to import).
+# =============================================================
+configure_interface_topology_apply() {
+  section "Interface Topology -- Apply"
+  local log="$LOGDIR/topology.log"
+
+  if [[ -f "$TOPOLOGY_APPLY_MARKER" ]]; then
+    step_ok "Interface topology already applied -- skipping"
+    sleep 1
+    return 0
+  fi
+  if [[ ! -f "$TOPOLOGY_STATE_FILE" ]]; then
+    step_fail "No topology state file at ${TOPOLOGY_STATE_FILE} -- configure_interface_topology_prompt() didn't run? Nothing to apply."
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$TOPOLOGY_STATE_FILE"
+
+  case "${TOPO_CASE:-}" in
+    single)
+      if [[ -z "${TOPO_IFACE:-}" ]]; then
+        step_info "Single-interface case recorded with nothing selected -- nothing to apply"
+      else
+        python3 -c "
+import sys
+sys.path.insert(0, '${INSTALL_BASE}/api')
+import zones_apply as za
+ok, msg = za.apply_single_interface_topology('${TOPO_IFACE}')
+print(msg)
+sys.exit(0 if ok else 1)
+" >>"$log" 2>&1
+        if [[ $? -eq 0 ]]; then
+          step_ok "${TOPO_IFACE} assigned to Inside (level 100)"
+        else
+          step_fail "Failed to assign ${TOPO_IFACE} -- see ${log}"
+        fi
+      fi
+      ;;
+
+    dual)
+      if [[ -z "${TOPO_INSIDE:-}" || -z "${TOPO_OUTSIDE:-}" ]]; then
+        step_info "Dual-interface case recorded with no Inside/Outside choice -- nothing to apply"
+      else
+        python3 -c "
+import sys
+sys.path.insert(0, '${INSTALL_BASE}/api')
+import zones_apply as za
+ok, msg = za.apply_dual_interface_topology('${TOPO_INSIDE}', '${TOPO_OUTSIDE}', nat=True)
+print(msg)
+sys.exit(0 if ok else 1)
+" >>"$log" 2>&1
+        if [[ $? -eq 0 ]]; then
+          step_ok "Inside=${TOPO_INSIDE} / Outside=${TOPO_OUTSIDE} applied, NAT enabled"
+        else
+          step_fail "Failed to apply topology -- see ${log}"
+        fi
+      fi
+      ;;
+
+    multi|none|"")
+      step_info "No auto-assignment needed for this topology -- configure via the web UI if desired"
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$TOPOLOGY_APPLY_MARKER")"
+  touch "$TOPOLOGY_APPLY_MARKER"
   sleep 1
 }
 
@@ -1075,31 +1126,42 @@ sleep 1
 
 check_root_and_os
 check_and_enable_selinux
-ensure_python3_available
-deploy_rsg_web || {
-  step_fail "Deployment failed -- nothing past this point can work without ${INSTALL_BASE}/api and ${INSTALL_BASE}/ui. Aborting."
-  exit 1
-}
-scrape_known_services
-# All operator-facing questions (interface topology, static/DHCP
-# addressing, gateway, DNS, NTP) are asked here, up front, before any
-# package installs run -- so nothing later in the install needs further
-# interaction. If a static IP was applied to any interface,
-# configure_interface_topology() reboots the box itself (after writing
-# a /root/.bash_profile hook that re-launches this script on next login)
-# and this script does not return from that call in that case.
-configure_interface_topology
+
+# Every operator-facing question -- interface topology, static/DHCP
+# addressing, gateway, DNS, NTP -- is asked here, first, before any
+# package installs or the app deploy run. Nothing later in the install
+# needs further interaction. This step is pure bash/nmcli/dialog, no
+# dependency on RSG-Web being deployed yet. If a static IP was applied
+# to any interface, it reboots the box itself (after writing a
+# /root/.bash_profile hook that re-launches this script on next login)
+# and does not return from that call in that case.
+configure_interface_topology_prompt
+
 run_system_upgrade
 install_base_packages
 install_python_packages
 remove_firewalld
 configure_nftables
-configure_selinux_rsgweb
 generate_ssl_cert
 configure_apache
 install_rsg_service
 configure_fail2ban
 configure_chrony
+
+# Deploy runs last, once the box itself is fully set up -- everything
+# below this line depends on RSG-Web actually being on disk (api/, ui/),
+# so it's grouped here together: the deploy itself, applying the
+# interface topology decisions gathered above (needs api/zones_apply.py
+# to import), the SELinux restorecon on ui/ (a no-op earlier since ui/
+# didn't exist yet to relabel), the known-services scrape, and the
+# platform update-check timer (needs upgrade/update_check.sh).
+deploy_rsg_web || {
+  step_fail "Deployment failed -- nothing past this point can work without ${INSTALL_BASE}/api and ${INSTALL_BASE}/ui. Aborting."
+  exit 1
+}
+configure_interface_topology_apply
+configure_selinux_rsgweb
+scrape_known_services
 install_rsg_update_check
 
 section "Done"
@@ -1109,8 +1171,8 @@ step_info "Installer logs: ${LOGDIR}"
 
 # Installer completed in a single boot (or resumed and finished) --
 # remove the auto-resume hook so a future manual reboot doesn't
-# re-launch the installer, and clear the topology marker so a
+# re-launch the installer, and clear the topology state so a
 # from-scratch re-run of this script (e.g. testing) asks the topology
 # questions again instead of thinking they're already done.
 sed -i '/## RSG-WEB Installer -- auto-resume after reboot ##/,/^fi$/d' /root/.bash_profile 2>/dev/null || true
-rm -f "$TOPOLOGY_MARKER" 2>/dev/null || true
+rm -f "$TOPOLOGY_STATE_FILE" "$TOPOLOGY_APPLY_MARKER" 2>/dev/null || true
