@@ -4,8 +4,9 @@
 #
 # Not standalone -- run via RSG-Web-Installer.sh, or directly from
 # inside a full clone/release tarball of the repo (deploy_rsg_web()
-# below expects api/, ui/, and installer/ alongside itself under
-# SRC_BASE, as a fallback if the release tarball download fails).
+# below expects api/ and ui/ as subdirectories, and this script,
+# RSG-Web-Installer.sh, and VERSION sitting flat, all alongside itself
+# under SRC_BASE, as a fallback if the release tarball download fails).
 GREEN="\033[0;32m"
 RED="\033[0;31m"
 YELLOW="\033[1;33m"
@@ -261,7 +262,15 @@ deploy_rsg_web() {
       mkdir -p "$INSTALL_BASE"
       cp -r "${SRC_BASE}/api"       "$INSTALL_BASE/" >>"$log" 2>&1
       cp -r "${SRC_BASE}/ui"        "$INSTALL_BASE/" >>"$log" 2>&1
-      [[ -d "${SRC_BASE}/installer" ]] && cp -r "${SRC_BASE}/installer" "$INSTALL_BASE/" >>"$log" 2>&1
+      # The installer scripts sit flat at SRC_BASE's root (alongside
+      # api/, ui/, and VERSION), not in their own installer/ subfolder --
+      # only the *deployed* copy at INSTALL_BASE/installer/ is a
+      # subdirectory. Copy them there by name instead of expecting a
+      # pre-existing SRC_BASE/installer/ to `cp -r`.
+      mkdir -p "${INSTALL_BASE}/installer"
+      for f in RSG-Web-Install.sh RSG-Web-Installer.sh; do
+        [[ -f "${SRC_BASE}/${f}" ]] && cp "${SRC_BASE}/${f}" "${INSTALL_BASE}/installer/" >>"$log" 2>&1
+      done
       [[ -d "${SRC_BASE}/upgrade" ]]   && cp -r "${SRC_BASE}/upgrade"   "$INSTALL_BASE/" >>"$log" 2>&1
       [[ -f "${SRC_BASE}/VERSION" ]]   && cp "${SRC_BASE}/VERSION"      "$INSTALL_BASE/" >>"$log" 2>&1
       # Verify the copy actually landed something usable -- cp itself can

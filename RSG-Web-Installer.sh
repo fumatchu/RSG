@@ -6,9 +6,10 @@
 # This is the small, standalone entry point -- meant to be fetched on
 # its own (curl/wget) before the rest of the repo exists on the box.
 # It installs just enough (wget, git, dialog) to clone the real repo,
-# then hands off to installer/RSG-Web-Install.sh, which is *not*
-# standalone -- it expects to be run from inside a full clone/tarball
-# of the repo (it deploys api/ and ui/ from alongside itself).
+# then hands off to RSG-Web-Install.sh (flat at the repo root, alongside
+# this script and VERSION -- api/ and ui/ are their own subdirectories),
+# which is *not* standalone -- it expects to be run from inside a full
+# clone/tarball of the repo (it deploys api/ and ui/ from alongside itself).
 
 GREEN="\033[0;32m"
 RED="\033[0;31m"
@@ -95,7 +96,7 @@ if [[ $? -ne 0 ]]; then
   exit 1
 fi
 
-chmod 700 "${INSTALL_DIR}/installer"/*.sh 2>/dev/null || true
+chmod 700 "${INSTALL_DIR}"/*.sh 2>/dev/null || true
 echo -e "  [${GREEN}✓${TEXTRESET}] Repository cloned to ${INSTALL_DIR}"
 
 dnf -y remove git >/dev/null 2>&1
@@ -145,7 +146,7 @@ fi
 
 case "$INSTALL_CHOICE" in
   1)
-    bash "${INSTALL_DIR}/installer/RSG-Web-Install.sh"
+    bash "${INSTALL_DIR}/RSG-Web-Install.sh"
     ;;
   *)
     echo -e "  [${YELLOW}→${TEXTRESET}] Installation cancelled."
