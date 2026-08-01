@@ -714,7 +714,36 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload >>"$log" 2>&1
   systemctl enable --now rsg-web >>"$log" 2>&1
-  sleep 3
+  # No is-active check here on purpose: deploy_rsg_web() hasn't run yet
+  # at this point in the install (it's grouped with the other api/ui-
+  # dependent steps after configure_chrony -- see MAIN), so
+  # /opt/rsg-web/api doesn't exist yet and uvicorn's WorkingDirectory
+  # will fail to CHDIR every single time, no matter how long we wait
+  # here. Restart=always/RestartSec=5 just keeps it retrying in the
+  # background; verify_rsg_service() (below) does the real check once
+  # deploy has actually happened.
+  step_info "rsg-web enabled -- will come up once RSG-Web is deployed (verified later)"
+  sleep 1
+}
+
+# =============================================================
+# STEP -- VERIFY RSG-WEB SERVICE (runs after deploy -- see MAIN below)
+#
+# install_rsg_service() above only enables the unit; it can't actually
+# start until /opt/rsg-web/api exists, which happens later in the run.
+# This does an explicit restart (rather than waiting up to 5s for
+# systemd's own Restart=always to retry on its own) and polls is-active
+# for a few seconds before reporting pass/fail for real.
+# =============================================================
+verify_rsg_service() {
+  section "RSG-WEB Service -- Verify"
+  systemctl restart rsg-web >/dev/null 2>&1
+  local tries=0
+  while (( tries < 10 )); do
+    systemctl is-active --quiet rsg-web && break
+    sleep 1
+    ((tries++))
+  done
   systemctl is-active --quiet rsg-web \
     && step_ok "rsg-web service running" \
     || { step_fail "rsg-web service failed to start"; step_info "Check: journalctl -u rsg-web -n 50 --no-pager"; }
@@ -1234,6 +1263,7 @@ deploy_rsg_web || {
 }
 configure_interface_topology_apply
 configure_selinux_rsgweb
+verify_rsg_service
 scrape_known_services
 install_rsg_update_check
 
